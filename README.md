@@ -43,7 +43,7 @@ The project follows a strict bottom-up hierarchical design:
 *   It features internal recurrent connections (`W_rec`) and residual pathways, acting as a "cortical column" capable of maintaining local temporal state.
 
 ### 4. Macro-Architecture (`src/cortical_hub.hpp`, `src/brain_block.hpp`)
-*   **CorticalHub**: The central router. It implements **Fast Weights ($M_t$)**, a short-term memory matrix updated via Hebbian rules ($M_{t+1} \leftarrow \lambda M_t + \eta (k \otimes v)$).
+*   **CorticalHub**: The central router. It implements **Fast Weights ($M_t$)**, a short-term memory matrix updated via Hebbian rules ( $M_{t+1} \leftarrow \lambda M_t + \eta (k \otimes v)$ ).
 *   **BrainBlock**: The high-level layer that runs multiple `MicroCircuit`s in parallel and fuses their outputs via the Hub.
 
 ## 🗺️ Roadmap

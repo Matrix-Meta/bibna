@@ -43,7 +43,7 @@
 *   它具備內部遞歸連接 (`W_rec`) 與殘差路徑，類似於大腦的「皮層柱 (Cortical Column)」，能夠維持局部的時序狀態。
 
 ### 4. 宏觀架構 (`src/cortical_hub.hpp`, `src/brain_block.hpp`)
-*   **CorticalHub**：中央路由器。它實作了 **快權重 ($M_t$)**，這是一個透過 Hebb 規則更新的短期記憶矩陣 ($M_{t+1} \leftarrow \lambda M_t + \eta (k \otimes v)$)。
+*   **CorticalHub**：中央路由器。它實作了 **快權重 ($M_t$)**，這是一個透過 Hebb 規則更新的短期記憶矩陣 ( $M_{t+1} \leftarrow \lambda M_t + \eta (k \otimes v)$ )。
 *   **BrainBlock**：高層模組，負責並行運行多個 `MicroCircuit` 並透過 Hub 融合其輸出。
 
 ## 🗺️ 開發路線圖 (Roadmap)
