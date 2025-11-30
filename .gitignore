@@ -114,7 +114,7 @@ tags
 !.vscode/launch.json
 !.vscode/extensions.json
 !.vscode/*.code-snippets
-
+I
 # Local History for Visual Studio Code
 .history/
 
@@ -125,5 +125,13 @@ tags
 # Ignore all local history of files
 .history
 .ionide
+
+# Build output
+build/
+
+# Some can run
+
+BiBNA_Batched.bin
+vocab.txt
 
 # End of https://www.toptal.com/developers/gitignore/api/vim,visualstudiocode,c,c++,cuda,direnv

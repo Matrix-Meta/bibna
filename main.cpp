@@ -1,290 +1,203 @@
-#include<iostream>
-#include <cmath>
-#include <iomanip>
-#include <vector>
-
-// 引入所有模組
 #include "src/acc.hpp"
 #include "src/bitlinear.hpp"
 #include "src/brain_block.hpp"
 #include "src/common.hpp"
 #include "src/cortical_hub.hpp"
 #include "src/decoding.hpp"
+#include "src/embedding.hpp"
 #include "src/micro_circuit.hpp"
+#include "src/mini_llm.hpp"
 #include "src/spiking_unit.hpp"
+#include "src/tokenizer.hpp"
 #include "src/training.hpp"
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <chrono>
 
-// ==========================================
-// 函式宣告 (Function Prototypes)
-// ==========================================
+int main()
+{
+    try
+    {
+        sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order());
+        std::cout << "Running on: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
 
-void gradient_check(sycl::queue& q);
-void micro_circuit_test(sycl::queue& q);
-void cortical_hub_test(sycl::queue& q);
-void generation_test(sycl::queue& q);
-void training_test(sycl::queue& q);
+        // ==========================================
+        // 1. 資料準備 (Data Preparation)
+        // ==========================================
+        std::cout << "Preparing Dataset...\n";
+        std::string base_text = "Hello, World! 現在是2025年，類腦脈衝神經網路模型BiBNA的極速訓練測試。";
+        std::string train_text;
+        // 重複文本以產生足夠的 Token 進行批次訓練
+            for (int i = 0; i < 5000; ++i)
+            train_text += base_text + " ";
 
-// ==========================================
-// 主程式 (Main Entry)
-// ==========================================
+        SimpleTokenizer tokenizer;
+        tokenizer.build_vocab(train_text); // 使用一部分來建立詞彙表
+        
+        std::vector<int> full_dataset = tokenizer.encode(train_text);
+        std::cout << "Total Tokens: " << full_dataset.size() << "\n";
+        std::cout << "Vocab Size: " << tokenizer.vocab_size << "\n";
 
-int main() {
-  try {
-    // 1. 初始化 SYCL Queue (自動選擇裝置)
-    sycl::queue q(sycl::default_selector_v);
-    std::cout << "Running on: "
-              << q.get_device().get_info<sycl::info::device::name>() << "\n";
+        // ==========================================
+        // 2. 超參數 (Hyperparameters)
+        // ==========================================
+        int dim = 64;
+        int num_circuits = 8; // 增加電路數量
+        int batch_size = 128; // 極大批次
+        int seq_len = 128;    // 更長的 BPTT 視窗
+        float lr = 0.002f;    // 稍微降低 LR 以適應大批次
+        int epochs = 5;       // 減少 Epochs 因為數據量變大
+        
+        // 計算批次數量
+        // 我們將數據切分為 (Batch_Size, Num_Batches * Seq_Len) 的形狀?
+        // 簡單做法：滑動視窗或直接切塊。
+        // 這裡採用標準語言模型做法：將數據視為長序列，切分為 BatchSize 個片段。
+        // 每個片段長度 = Total / BatchSize
+        int total_len = full_dataset.size();
+        int batch_len = total_len / batch_size; // 每個批次序列的長度
+        int num_steps = batch_len / seq_len;    // 每個批次序列可以切多少個 seq_len
+        
+        std::cout << "Training Config:\n"
+                  << "  Batch Size: " << batch_size << "\n"
+                  << "  Seq Len   : " << seq_len << "\n"
+                  << "  Batches/Ep: " << num_steps << "\n"
+                  << "  Total Step: " << num_steps * epochs << "\n" << std::endl;
 
-    // 2. 依序執行所有階段的測試
+        // 準備 Batch 數據指標
+        // data_batches[b] 指向第 b 個序列的起始位置
+        std::vector<int> data_starts(batch_size);
+        for(int b=0; b<batch_size; ++b) {
+            data_starts[b] = b * batch_len;
+        }
 
-    // Phase 1: 基礎算子與梯度檢查
-    gradient_check(q);
+        // ==========================================
+        // 3. 模型初始化
+        // ==========================================
+        MiniLLM model(tokenizer.vocab_size, dim, num_circuits, q);
+        model.init_buffers(batch_size); 
+        
+        TrainingTools trainer(q);
+        AntiCollapse decoder(q, 1.2f, dim);
 
-    // Phase 2: 微迴路與時間遞迴測試
-    micro_circuit_test(q);
+        // ==========================================
+        // 4. 訓練迴圈 (Training Loop)
+        // ==========================================
+        std::cout << "=== Starting High-Performance Training ===\n";
+        auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Phase 3: 整合層與快權重穩定性測試
-    cortical_hub_test(q);
+        for (int epoch = 0; epoch < epochs; ++epoch)
+        {
+            // 每個 Epoch 開始時重置狀態 (SNN/RNN 狀態)
+            std::vector<Tensor>* states_ptr = &model.brain->init_states(batch_size);
+            
+            float epoch_loss = 0.0f;
+            int loss_count = 0;
 
-    // Phase 5: 生成循環、ACC 監控與動態懲罰測試
-    // (註：Phase 4 已整合進此函式)
-    generation_test(q);
+            // 批次迴圈 (實際上是長序列的時間步迴圈，只是被切分為 seq_len 塊)
+            for (int step = 0; step < num_steps; ++step)
+            {
+                // 為了避免複製，我們需要 Tensor 支援移動，std::vector 支援 push_back(move)
+                // 但我們在 loop 內，d_logits 是區域變數。
+                // 我們需要一個持久的容器給 backward_through_time 使用。
+                // 由於 MiniLLM 的設計是 history 驅動的，我們只需傳遞 d_logits。
+                // 但 backward_through_time 需要**所有步驟**的梯度。
+                // 所以我們需要在外部收集一個 `window_grads`。
+                static std::vector<Tensor> window_grads; // Static to reuse memory capacity
+                window_grads.clear();
 
-    // Phase 6: 訓練迴圈測試 (SGD & Backprop)
-    training_test(q);
+                // 序列內的 Token 迴圈 (BPTT Window)
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    // 準備當前時間步的輸入與目標
+                    // Input: [Batch] -> indices
+                    std::vector<int> input_ids(batch_size);
+                    std::vector<int> target_ids(batch_size);
+                    
+                    int global_ptr_offset = step * seq_len + t;
+                    
+                    for(int b=0; b<batch_size; ++b) {
+                        int ptr = data_starts[b] + global_ptr_offset;
+                        if (ptr < total_len - 1) {
+                            input_ids[b] = full_dataset[ptr];
+                            target_ids[b] = full_dataset[ptr+1];
+                        } else {
+                            input_ids[b] = 0; // Padding/End
+                            target_ids[b] = 0;
+                        }
+                    }
 
-  } catch (sycl::exception& e) {
-    std::cerr << "SYCL Exception: " << e.what() << "\n";
-    return 1;
-  } catch (std::exception& e) {
-    std::cerr << "Standard Exception: " << e.what() << "\n";
-    return 1;
-  }
+                    // 前向傳播 (Parallel Batch)
+                    auto result = model.forward_step(input_ids, *states_ptr);
+                    Tensor &logits = result.first;
+                    states_ptr = &result.second;
 
-  return 0;
-}
+                    // 損失計算 & 梯度
+                    Tensor d_logits(logits.size, q);
+                    float loss = trainer.cross_entropy_loss(logits, target_ids, d_logits, t, 1000); // 減少同步頻率
+                    
+                    if (loss > 0.0f) {
+                        epoch_loss += loss;
+                        loss_count++;
+                    }
+                    
+                    // 儲存 BPTT 梯度
+                    window_grads.push_back(std::move(d_logits));
+                } // End Seq Loop
 
-// ==========================================
-// 函式定義 (Function Definitions)
-// ==========================================
+                // 觸發 BPTT 和 權重更新 (每 seq_len 步一次)
+                model.backward_through_time(window_grads);
+                model.update_weights(trainer, lr, 1e-4f, 1.0f / (seq_len * batch_size));
+                
+                // 進度條
+                if (step % 10 == 0) {
+                    std::cout << "\rEpoch " << epoch << " | Step " << step << "/" << num_steps 
+                              << " | Loss: " << (loss_count > 0 ? epoch_loss/loss_count : 0.0f) << std::flush;
+                    epoch_loss = 0.0f;
+                    loss_count = 0;
+                }
+            }
+            std::cout << "\n";
+        }
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> diff = end_time - start_time;
+        std::cout << "Training Finished in " << diff.count() << " s\n";
+        std::cout << "Speed: " << (total_len * epochs) / diff.count() << " tokens/s\n";
 
-// Phase 1: Gradient Check
-void gradient_check(sycl::queue& q) {
-  std::cout << "\n=== Running Phase 1: Gradient Check ===\n";
-
-  int batch = 2;
-  int in_dim = 4;
-  int out_dim = 4;
-
-  Tensor input(batch * in_dim, q);
-  input.random_init(0.5f, 0.5f);
-
-  BitLinear bitnet(in_dim, out_dim, q);
-  SpikingUnit spike(q, 0.0f, 2.0f);  // Theta=0, allow easy firing
-
-  std::cout << "[Forward Pass]...\n";
-  Tensor linear_out = bitnet.forward(input);
-  Tensor spike_out = spike.forward(linear_out);
-
-  std::cout << "[Backward Pass]...\n";
-  Tensor grad_loss(spike_out.size, q);
-  q.fill(grad_loss.data, 1.0f, grad_loss.size).wait();
-
-  spike.backward(grad_loss);
-  bitnet.backward(linear_out);
-
-  std::cout << "[Check A] SpikingUnit Surrogate Gradient:\n";
-  bool surrogate_active = false;
-  // 檢查前 4 個元素
-  std::vector<float> h_v(4), h_grad(4);
-  q.memcpy(h_v.data(), linear_out.data, 4 * sizeof(float)).wait();
-  q.memcpy(h_grad.data(), linear_out.grad, 4 * sizeof(float)).wait();
-
-  for (int i = 0; i < 4; ++i) {
-    float expected = 1.0f / (1.0f + 4.0f * h_v[i] * h_v[i]);
-    std::cout << "  v: " << std::fixed << std::setprecision(4) << h_v[i]
-              << " | Grad: " << h_grad[i] << " | Expected: " << expected
-              << "\n";
-    if (std::abs(h_grad[i]) > 1e-5) surrogate_active = true;
-  }
-
-  if (surrogate_active)
-    std::cout << ">>> PASS: Surrogate Gradient works.\n";
-  else
-    std::cout << ">>> FAIL: Zero Gradients.\n";
-
-  std::cout << "[Check B] BitLinear Gradient Flow:\n";
-  // 簡單檢查 input.grad 是否非零
-  std::vector<float> h_in_grad(4);
-  q.memcpy(h_in_grad.data(), input.grad, 4 * sizeof(float)).wait();
-  if (std::abs(h_in_grad[0]) > 1e-6)
-    std::cout << ">>> PASS: BitLinear Backward works.\n";
-  else
-    std::cout << ">>> FAIL: Input Gradient is zero.\n";
-}
-
-// Phase 2: MicroCircuit Loop
-void micro_circuit_test(sycl::queue& q) {
-  std::cout << "\n=== Running Phase 2: MicroCircuit Loop Test ===\n";
-
-  int batch = 2;
-  int dim = 4;
-  int hidden = 8;
-  int time_steps = 3;
-
-  MicroCircuit mc(dim, hidden, q);
-  Tensor s_state(batch * hidden, q);
-  // s_state 初始為 0
-
-  std::cout << "Starting Time Loop (" << time_steps << " steps)...\n";
-
-  for (int t = 0; t < time_steps; ++t) {
-    Tensor x_t(batch * dim, q);
-    x_t.random_init(0.5f, 0.5f);
-
-    // 執行一步
-    auto result = mc.forward_step(x_t, s_state);
-
-    // 更新狀態 (使用 move 語意)
-    s_state = std::move(result.second);
-
-    std::cout << "  [Step " << t + 1 << "] Completed. State updated.\n";
-  }
-
-  std::cout << ">>> PASS: MicroCircuit time loop execution successful.\n";
-}
-
-// Phase 3: CorticalHub & Fast Weights
-void cortical_hub_test(sycl::queue& q) {
-  std::cout << "\n=== Running Phase 3: CorticalHub & Fast Weights Test ===\n";
-
-  int batch = 2;
-  int num_circuits = 4;
-  int dim = 8;
-  int time_steps = 20;
-
-  CorticalHub hub(dim, dim, num_circuits, q);
-  hub.init_memory(batch);
-
-  std::cout << "Starting Memory Stability Loop (" << time_steps
-            << " steps)...\n";
-
-  for (int t = 0; t < time_steps; ++t) {
-    Tensor fake_inputs(batch * num_circuits * dim, q);
-    fake_inputs.random_init(0.1f, 1.0f);
-
-    hub.update_memory(fake_inputs);
-
-    if ((t + 1) % 5 == 0) {
-      float norm = hub.get_memory_norm();
-      std::cout << "  [Step " << std::setw(2) << t + 1 << "] M_t Norm: " << norm
-                << "\n";
-
-      if (std::isnan(norm) || std::isinf(norm) || norm > 1000.0f) {
-        std::cout << ">>> FAIL: Memory Exploded!\n";
-        return;
-      }
+        // =========================================
+        // 5. 存檔與推論 (Inference)
+        // =========================================
+        model.save_to_file("BiBNA_Batched.bin");
+        tokenizer.save_vocab("vocab.txt"); // Ensure this line is present
+        
+        std::cout << "\n=== Batched Inference Test ===\n";
+        // 為了推論，我們使用 Batch=1
+        MiniLLM infer_model(tokenizer.vocab_size, dim, num_circuits, q);
+        infer_model.load_from_file("BiBNA_Batched.bin");
+        
+        std::string prompt = "Hello";
+        std::vector<int> input = tokenizer.encode(prompt);
+        std::vector<Tensor>* s_ptr = &infer_model.brain->init_states(1);
+        
+        std::cout << prompt;
+        int next_token = input.back();
+        
+        for(int i=0; i<50; ++i) {
+            auto res = infer_model.forward_step({next_token}, *s_ptr);
+            s_ptr = &res.second;
+            
+            // Sample
+            next_token = decoder.sample(res.first);
+            std::cout << tokenizer.decode({next_token}) << std::flush;
+        }
+        std::cout << "\nDone.\n";
     }
-  }
-  std::cout << ">>> PASS: Fast Weights updated stably.\n";
-}
-
-// Phase 5: Generation, ACC & Anti-Collapse
-void generation_test(sycl::queue& q) {
-  std::cout << "\n=== Running Phase 5: ACC & Dynamic Generation ===\n";
-
-  int dim = 16;
-  int num_circuits = 2;
-  int seq_len = 10;
-
-  BrainBlock block(num_circuits, dim, q);
-  AntiCollapse decoder(q, 1.2f, dim);
-  ConflictMonitor acc(q);
-
-  auto states = block.init_states(1);
-  std::vector<int> history;
-  Tensor input(dim, q);
-  input.random_init(0.5f, 0.5f);
-
-  std::cout << "Generating with Dynamic Control...\n";
-
-  for (int t = 0; t < seq_len; ++t) {
-    // 1. Forward
-    auto result = block.forward(input, states);
-    Tensor& logits = result.first;
-    states = std::move(result.second);
-
-    // 2. ACC 監測
-    float entropy = acc.calculate_uncertainty(logits);
-    // 設定較低的閾值 0.5 以便觀察 ACC 觸發
-    bool high_conflict = acc.is_high_conflict(entropy, 0.5f);
-
-    std::cout << "  Step " << std::setw(2) << t + 1
-              << " | Entropy: " << std::fixed << std::setprecision(3)
-              << entropy;
-
-    // 3. Meta-Controller 介入
-    if (high_conflict) {
-      std::cout << " [ACC ALERT] -> Boosting Penalty.";
-      decoder.apply_penalty(logits, history);
-      decoder.apply_penalty(logits, history);
-    } else {
-      decoder.apply_penalty(logits, history);
+    catch (sycl::exception const &e)
+    {
+        std::cout << "SYCL Exception: " << e.what() << "\n";
+        return 1;
     }
-
-    // 4. Sampling
-    int token = decoder.sample(logits);
-    history.push_back(token);
-
-    std::cout << " -> Picked: " << token << "\n";
-
-    // 更新 Input (模擬 Embedding lookup)
-    q.memcpy(input.data, logits.data, dim * sizeof(float)).wait();
-  }
-
-  std::cout << ">>> PASS: ACC integrated. Dynamic control flow verified.\n";
+    return 0;
 }
-
-// Phase 6: Training Loop
-void training_test(sycl::queue& q) {
-  std::cout << "\n=== Running Phase 6: Training Loop (SGD) ===\n";
-
-  int dim = 4;
-  float lr = 0.1f;
-  int epochs = 100;
-
-  BitLinear layer(dim, dim, q);
-  TrainingTools trainer(q);
-
-  Tensor input(dim, q);
-  q.fill(input.data, 1.0f, input.size).wait();
-  int target_idx = 0;
-
-  std::cout << "Task: Learn to classify Input[1,1,1,1] as Class 0\n";
-
-  for (int i = 0; i < epochs; ++i) {
-    // A. Forward
-    Tensor output = layer.forward(input);
-
-    // B. Loss Calculation
-    Tensor d_output(dim, q);
-    float loss = trainer.cross_entropy(output, target_idx, d_output);
-
-    if (i % 20 == 0 || i == epochs - 1) {
-      std::cout << "  Epoch " << std::setw(3) << i << " | Loss: " << std::fixed
-                << std::setprecision(4) << loss << "\n";
-    }
-
-    // C. Backward
-    layer.backward(d_output);
-
-    // D. Update
-    trainer.sgd_step(layer.weights, lr);
-
-    // E. Zero Gradients (Input is reused)
-    input.zero_grad();
-  }
-
-  std::cout << ">>> PASS: Training loop finished.\n";
-}
-

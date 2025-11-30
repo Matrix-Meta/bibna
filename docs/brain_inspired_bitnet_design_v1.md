@@ -4,7 +4,6 @@
 > 以大量微節點局部推理、短期關聯記憶、ACC 式衝突監測與持續學習為核心，
 > 並內建防「過激反應」與「崩壞重複」的修補機制。
 
-
 ---
 
 ## 1. 系統總體目標與設計原則
@@ -30,14 +29,12 @@
    - 初始版本設計為 **10M–100M 參數級**小模型，在單機或一般伺服器即可訓練與推理。  
    - 所有組件皆可在任意作業系統與硬體上實作，只要支援現代深度學習框架。  
 
-
 ### 1.2 設計原則
 
 - **模組化**：基礎算子層、微結構層、整合層、記憶層、控制層、解碼層清楚分離。  
 - **自底向上**：先保證單元（BitLinear、SpikingUnit、MicroCircuit）行為正確，再向上堆疊。  
 - **可退回 baseline**：每一層皆可切換為「標準 Transformer/MLP」實作，以便對照與除錯。  
 - **漸進式複雜化**：先實作最小可用版本，再逐步加入 fast weights、ACC、持續學習。  
-
 
 ---
 
@@ -72,19 +69,18 @@
    - 重複懲罰 / no-repeat-ngrams。  
    - 崩壞偵測與安全中止策略。  
 
-
 ---
 
 ## 3. 基礎算子層設計
 
 ### 3.1 BitLinear：低位元線性層
 
-**介面**
+#### 介面
 
 - 輸入：`x ∈ R^{batch × d_in}`  
 - 輸出：`y ∈ R^{batch × d_out}`  
 
-**內部狀態**
+#### 內部狀態
 
 - FP32 主權重：`W_float ∈ R^{d_out × d_in}`  
 - 量化權重：`W_q ∈ {-1, 0, +1}^{d_out × d_in}`  
@@ -96,23 +92,22 @@
 - 否則 → `sign(W_float)`（即 -1 或 +1）  
 - `τ` 可為固定常數或 learnable 閾值。  
 
-**Forward**
+#### Forward
 
 ```text
 W_q = Q(W_float)
 y = x @ W_q^T + b
 ```
 
-**Backward**
+#### Backward
 
 - 對 `W_float` 計算梯度（使用 Straight-Through Estimator 或其他平滑近似）。  
 - 更新 `W_float` 後重新量化產生新的 `W_q`。  
 
-**目標**
+#### 目標
 
 - 對齊 BitNet 的低位元、低能耗精神。  
 - 提供簡易、可攜的實作基礎（不限語言與硬體）。  
-
 
 ### 3.2 SpikingUnit：類脈衝神經元
 
@@ -121,11 +116,11 @@ y = x @ W_q^T + b
 - 膜電位：`v_t`  
 - 前一時間步輸出：`s_{t-1}`  
 
-**輸入**
+#### 輸入
 
 - 凈輸入電流：`u_t`（可由 `BitLinear` 產生）。  
 
-**更新方程（概念）**
+#### 更新方程（概念）
 
 ```text
 # 膜電位更新（漏電 + 發放後復位）
@@ -144,11 +139,10 @@ s_t = spike(v_t - θ)
   - 理想情況：`1_{v_t > θ}`；  
   - 實作時採用 sigmoid/HardSigmoid + STE 做近似，利於反向傳播。  
 
-**用途**
+#### 用途
 
 - 作為 MicroCircuit 內部與輸入/輸出層的基本運算單元。  
 - 提供時間相依、非線性、類生物動力學行為。  
-
 
 ---
 
@@ -163,11 +157,10 @@ s_t = spike(v_t - θ)
 - 外部輸入投影：`W_in`（BitLinear）。  
 - 外部輸出 readout：`W_out`（BitLinear）。  
 
-**設計意圖**
+#### 設計意圖
 
 - 模擬皮質微柱/局部神經群，對局部資訊做「小範圍推理」。  
 - 大量並列的 MicroCircuit 構成整體模型的「小節點群」。  
-
 
 ### 4.2 單步更新流程
 
@@ -186,10 +179,10 @@ u_rec = W_rec(s_{t-1})       # 內部 recurrent
 u     = u_ext + u_rec
 ```
 
-3. **更新 N 個 SpikingUnit 狀態**  
+1. **更新 N 個 SpikingUnit 狀態**  
    - 對每個單元使用 SpikingUnit 更新方程計算 `v_t` 與 `s_t`。  
 
-4. **聚合輸出局部摘要 `h_i_t`**  
+2. **聚合輸出局部摘要 `h_i_t`**  
 
 ```text
 h_i_t = W_out(s_t)
@@ -197,13 +190,11 @@ h_i_t = W_out(s_t)
 
 其中 `h_i_t` 為該 MicroCircuit 在時間 t 的局部表示向量。  
 
-
 ### 4.3 多 MicroCircuit 並行
 
 - 系統中存在 M 個 `MicroCircuit`（i = 1..M）。  
 - 每個 `MicroCircuit` 可透過不同的輸入路由獲得不同區域/功能的資訊。  
 - 在實作上可以視為 batch/模組維度上的並行運算。  
-
 
 ---
 
@@ -218,13 +209,12 @@ h_i_t = W_out(s_t)
 3. 對 `h_i_t` 執行群組/局部注意力與抑制。  
 4. 產生新的全局狀態 `g_t`，並可對 `h_i_t` 做調制回饋。  
 
-
 ### 5.2 Fast Weights `M_t` 設計
 
 - `M_t ∈ R^{d_h × d_h}`（`d_h` 為 `h_i` 維度）。  
 - 作為整體短期關聯記憶矩陣。  
 
-**更新規則（含修補）**
+#### 更新規則（含修補）
 
 ```text
 M_{t+1} = λ * M_t + η * Σ_i (k_i ⊗ v_i)
@@ -240,7 +230,6 @@ M_{t+1} = clamp(M_{t+1}, -c, c)
 
 > 此設計避免 fast weights 在單次錯誤寫入後將錯誤模式長期放大。  
 
-
 ### 5.3 群組注意力 + 抑制
 
 對每個 microcircuit 的局部表示 `h_i`：  
@@ -253,7 +242,7 @@ k_i = W_k(h_i)
 v_i = W_v(h_i)
 ```
 
-2. **計算相似度**  
+1. **計算相似度**  
 
 ```text
 S_base(i, j) = q_i · k_j
@@ -261,19 +250,18 @@ S_fast(i, j) = q_i · (M_t k_j)
 S_ij         = S_base(i, j) + S_fast(i, j)
 ```
 
-3. **局部化 / 分組**  
+1. **局部化 / 分組**  
    - 對每個 i，只在附近/同組的 j 上計算 softmax（群組或局部注意力），而非全域。  
 
-4. **抑制機制**  
-   - 對於同一群中 activation 過高的單元，對其他單元施加減權或抑制，模擬局部競爭。  
+2. **抑制機制**  
+   - 對於同一群中 activation 過高的單元，對其他單元施加減權或抑制,模擬局部競爭。  
 
-5. **輸出更新後的 `h'_i` 與全局狀態 `g_t`**  
+3. **輸出更新後的 `h'_i` 與全局狀態 `g_t`**
 
 ```text
 h'_i = Σ_j softmax(S_i·)_j * v_j
 g_t  = Readout({h'_i})      # 例如平均、加權平均或另一層 BitLinear
 ```
-
 
 ---
 
@@ -294,7 +282,6 @@ g_t  = Readout({h'_i})      # 例如平均、加權平均或另一層 BitLinear
    - 主幹 BitNet 權重（`BitLinear`、`SpikingUnit` 等）。  
    - 在預訓練與定期再訓練過程中緩慢更新，逐步固化穩定知識。  
 
-
 ### 6.2 持續學習流程（概念）
 
 1. **線上推理階段**  
@@ -308,25 +295,24 @@ g_t  = Readout({h'_i})      # 例如平均、加權平均或另一層 BitLinear
    - 週期性選取 buffer 中高價值樣本，  
    - 更新 adapter 或選定子網權重，避免 catastrophic forgetting。  
 
-
 ---
 
 ## 7. 控制層設計：ACC + Meta-controller
 
 ### 7.1 ACC 群簇：衝突與不確定偵測
 
-**輸入特徵（示意）**
+#### 輸入特徵（示意）
 
 - 各 `h_i` 之間的 variance / cosine similarity（反映微節點間分歧）。  
 - 模型輸出 logits 的 entropy（反映不確定度）。  
 - 若有多候選答案，候選間差異度（例如 KL divergence）。  
 
-**輸出**
+#### 輸出
 
 - `conflict_level ∈ [0, 1]`  
 - `uncertainty ∈ [0, 1]`  
 
-**校正（Calibration）**
+#### 校正（Calibration）
 
 1. 收集一批推理案例，標記為「明顯錯誤」「基本正確」等。  
 2. 訓練一個小 MLP 或 MicroCircuit 當 ACC classifier。  
@@ -336,8 +322,7 @@ g_t  = Readout({h'_i})      # 例如平均、加權平均或另一層 BitLinear
 conflict_norm = (conflict_raw - μ_conflict) / σ_conflict
 ```
 
-4. 設定門檻，例如 `conflict_norm > 2` 才視為高衝突。  
-
+1. 設定門檻，例如 `conflict_norm > 2` 才視為高衝突。  
 
 ### 7.2 Meta-controller：推理策略管理
 
@@ -351,19 +336,18 @@ Meta-controller 根據 ACC 的輸出，控制：
 - 若已達上限：  
   - 直接選用目前最佳答案，並建議模型以保守語氣表達不確定性。  
 
-2. **解碼策略（溫度與採樣）**  
+1. **解碼策略（溫度與採樣）**  
 
 - 若 `conflict_norm` 高：  
   - 可略微降低溫度或多 sample 幾次，再由裁決器選擇。  
   - 或切換「保守模式」prompt：鼓勵列出多種可能。  
 
-3. **語氣控制**  
+1. **語氣控制**  
 
 - 若 `uncertainty` 高：  
   - 在 prompt 或控制信號中加入「應避免絕對斷言，允許表達不確定」。  
 
 > 關鍵修補：ACC **不直接否決答案**，僅調整策略與語氣，並由反思輪數上限避免無限 loop。  
-
 
 ---
 
@@ -376,7 +360,6 @@ Meta-controller 根據 ACC 的輸出，控制：
 - `top_k ≈ 40–100`  
 
 可依模型大小與實測行為調整。  
-
 
 ### 8.2 重複控制
 
@@ -393,11 +376,10 @@ for each token:
 
 - 範例：`N_threshold = 3, penalty_factor = 1.2`。  
 
-2. **no-repeat-ngrams**  
+1. **no-repeat-ngrams**  
 
 - 維護一個已生成 n-grams 的集合（建議 3-gram 或 4-gram）。  
 - 對於任何會產生已存在 n-gram 的候選 token，將其 logit 設為負無窮（禁止選擇）。  
-
 
 ### 8.3 崩壞偵測與中止
 
@@ -415,14 +397,12 @@ for each token:
    - 嘗試一次重新生成（不同 seed/策略）。  
    - 或直接進入保守模式回答不確定。  
 
-
 ---
 
 ## 9. 實作路線（分階段）
 
 以下實作路線假定使用任意深度學習框架（如 PyTorch、JAX、TensorFlow 等），
 但不依賴特定作業系統或特定 GPU/CPU。
-
 
 ### 第 0 階段：環境與 baseline 準備
 
@@ -440,7 +420,6 @@ for each token:
    - baseline 能穩定訓練與推理。  
    - 解碼時行為合理。  
 
-
 ### 第 1 階段：基礎算子層實作與測試
 
 **目標：** 實作 `BitLinear` 與 `SpikingUnit`，並驗證其正確性與可訓練性。
@@ -452,7 +431,6 @@ for each token:
 2. 實作 `SpikingUnit`：  
    - 利用簡易函式（sigmoid + STE）實作 spike 近似。  
    - 在簡單任務（例如一維序列分類、簡單時間序列）上驗證能學到模式。  
-
 
 ### 第 2 階段：MicroCircuit 與 CorticalHub 原型
 
@@ -467,7 +445,6 @@ for each token:
    - 實作 fast weights `M_t` 更新（含衰減與 clamp）。  
    - 實作群組注意力與抑制。  
    - 用簡單任務測試整合能力（例如從多個輸入中選取關鍵資訊）。  
-
 
 ### 第 3 階段：整合為「BrainBlock」與玩具語言模型
 
@@ -488,7 +465,6 @@ for each token:
    - 記錄 loss / perplexity，與 baseline 比較。  
    - 檢查生成行為（即使用粗糙模型，也應避免立即崩壞）。  
 
-
 ### 第 4 階段：引入 fast weights 完整流程與 Anti-collapse 解碼
 
 **目標：** 將 fast weights `M_t` 與解碼修補整合進主模型。
@@ -505,7 +481,6 @@ for each token:
 3. 以固定測試 prompt 比較：  
    - 有/無 Anti-collapse 的差異。  
    - 有/無 fast weights 的差異。  
-
 
 ### 第 5 階段：ACC 與 Meta-controller
 
@@ -525,7 +500,6 @@ for each token:
    - 訓練小 MLP 或 MicroCircuit 作為 ACC。  
    - 對輸出做校正（z-score + 門檻重設）。  
 
-
 ### 第 6 階段：持續學習與經驗式成長
 
 **目標：** 讓模型隨互動逐步成長，而非訓練完即凍結。
@@ -540,7 +514,6 @@ for each token:
 3. 設計可量測任務：  
    - 例如特定領域問答的正確率隨時間上升。  
    - 以此驗證經驗式成長機制確實生效。  
-
 
 ---
 
